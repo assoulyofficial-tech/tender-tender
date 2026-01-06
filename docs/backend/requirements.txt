@@ -15,5 +15,19 @@ pydantic-settings==2.1.0
 # Scraping
 playwright==1.41.2
 
+# Text Extraction
+PyMuPDF==1.23.8
+python-docx==1.1.0
+openpyxl==3.1.2
+xlrd==2.0.1
+
+# OCR (CPU only)
+paddlepaddle==2.6.0
+paddleocr==2.7.3
+Pillow==10.2.0
+
+# HTTP Client
+httpx==0.26.0
+
 # Utilities
 python-dateutil==2.8.2

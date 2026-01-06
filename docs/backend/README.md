@@ -79,6 +79,9 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | `/api/scraping/last-result` | GET | Get last scrape result |
 | `/api/scraping/clear-memory` | POST | Clear in-memory documents |
 | `/api/scraping/documents/{ref}` | GET | Get tender docs in memory |
+| `/api/extraction/trigger` | POST | Trigger text extraction |
+| `/api/extraction/tender/{id}` | POST | Extract for specific tender |
+| `/api/extraction/pending` | POST | Process pending documents |
 
 ### Trigger Scraping
 
@@ -94,6 +97,21 @@ curl -X POST http://localhost:8000/api/scraping/trigger \
   -d '{"target_date": "2024-01-15", "category": "Fournitures"}'
 ```
 
+### Trigger Text Extraction
+
+```bash
+# Extract from specific tender
+curl -X POST http://localhost:8000/api/extraction/tender/{tender-uuid}
+
+# Process all pending documents
+curl -X POST "http://localhost:8000/api/extraction/pending?limit=50"
+
+# Trigger with optional tender_id
+curl -X POST http://localhost:8000/api/extraction/trigger \
+  -H "Content-Type: application/json" \
+  -d '{"tender_id": "uuid-here"}'
+```
+
 ### CLI Usage
 
 ```bash
@@ -106,7 +124,13 @@ python -m app.cli scrape --date 2024-01-15 --save
 # Scrape with visible browser
 python -m app.cli scrape --visible
 
-# Check status
+# Extract text from a tender's documents
+python -m app.cli extract --tender-id UUID
+
+# Process all pending documents
+python -m app.cli extract --pending --limit 50
+
+# Check status (includes extraction deps)
 python -m app.cli status
 ```
 
@@ -135,6 +159,37 @@ python -m app.cli status
 - `ProcessingStatus`: pending, scraping, downloading, ocr, analyzing, completed, failed
 - `FieldSource`: scraped, ocr, ai, manual
 
+## Text Extraction Pipeline
+
+### Supported Formats
+
+| Format | Method | Notes |
+|--------|--------|-------|
+| PDF (digital) | PyMuPDF | Direct text extraction |
+| PDF (scanned) | PaddleOCR | Automatic fallback |
+| DOCX | python-docx | Paragraphs + tables |
+| DOC | - | Not supported (convert to DOCX) |
+| XLSX | openpyxl | All sheets |
+| XLS | xlrd | All sheets |
+
+### OCR Configuration
+
+- Engine: PaddleOCR (local, CPU-only)
+- Language: French (`lang='fr'`)
+- Fallback: Only when digital extraction fails
+
+### Installation Notes
+
+```bash
+# PaddlePaddle (CPU)
+pip install paddlepaddle
+
+# PaddleOCR
+pip install paddleocr
+
+# Note: First OCR run will download models (~150MB)
+```
+
 ## Project Structure
 
 ```
@@ -144,15 +199,24 @@ docs/backend/
 │   ├── main.py          # FastAPI app
 │   ├── config.py        # Settings
 │   ├── database.py      # DB connection
+│   ├── cli.py           # CLI commands
 │   ├── models/          # SQLAlchemy models
 │   │   ├── __init__.py
 │   │   └── tender.py
 │   ├── schemas/         # Pydantic schemas
 │   │   ├── __init__.py
 │   │   └── tender.py
+│   ├── services/        # Business logic
+│   │   ├── __init__.py
+│   │   ├── scraper.py
+│   │   ├── scraper_db.py
+│   │   ├── extractor.py      # Text extraction
+│   │   └── extraction_db.py  # DB integration
 │   └── api/             # API routes
 │       ├── __init__.py
-│       └── tenders.py
+│       ├── tenders.py
+│       ├── scraping.py
+│       └── extraction.py
 ├── alembic/             # Migrations
 ├── alembic.ini
 ├── requirements.txt
@@ -161,7 +225,8 @@ docs/backend/
 
 ## Next Steps (Future Prompts)
 
-- [ ] Step 2: Scraping module
-- [ ] Step 3: OCR pipeline (PaddleOCR)
+- [x] Step 1: Database schema & API
+- [x] Step 2: Scraping module
+- [x] Step 3: Text extraction pipeline (OCR)
 - [ ] Step 4: AI analysis (DeepSeek)
 - [ ] Step 5: Background job queue

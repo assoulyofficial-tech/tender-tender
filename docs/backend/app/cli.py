@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
 CLI for Tender AI Platform.
-Run scraping from command line.
+Run scraping and extraction from command line.
 
 Usage:
     python -m app.cli scrape --date 2024-01-15
     python -m app.cli scrape --yesterday
+    python -m app.cli extract --tender-id UUID
+    python -m app.cli extract --pending
     python -m app.cli status
 """
 
@@ -13,9 +15,11 @@ import argparse
 import asyncio
 import sys
 from datetime import datetime, timedelta
+from uuid import UUID
 
 from app.services.scraper import run_scraper, PLAYWRIGHT_AVAILABLE
 from app.services.scraper_db import ScraperDBService, document_store
+from app.services.extraction_db import ExtractionDBService
 from app.database import SessionLocal
 
 
@@ -92,13 +96,82 @@ def cmd_scrape(args):
         print(f"  ... and {len(result.tenders) - 10} more")
 
 
+def cmd_extract(args):
+    """Run text extraction command."""
+    print("Text Extraction Pipeline")
+    print("=" * 40)
+    
+    db = SessionLocal()
+    try:
+        service = ExtractionDBService(db)
+        
+        if args.tender_id:
+            try:
+                tender_id = UUID(args.tender_id)
+            except ValueError:
+                print(f"ERROR: Invalid UUID: {args.tender_id}")
+                sys.exit(1)
+            
+            print(f"Extracting from tender: {tender_id}")
+            result = service.process_tender(tender_id)
+            
+            if "error" in result:
+                print(f"ERROR: {result['error']}")
+                sys.exit(1)
+            
+            print(f"\nResults for: {result['reference']}")
+            print(f"  Successful: {result['success_count']}")
+            print(f"  Failed: {result['error_count']}")
+            
+            for doc in result['documents']:
+                status = "✓" if doc['success'] else "✗"
+                method = f"({doc['method']})" if doc['method'] else ""
+                print(f"  {status} {doc['filename']} {method}")
+                if doc['error']:
+                    print(f"      Error: {doc['error']}")
+                elif doc['text_length']:
+                    print(f"      Extracted: {doc['text_length']} chars, {doc['page_count'] or '?'} pages")
+        
+        elif args.pending:
+            print(f"Processing pending documents (limit: {args.limit})")
+            result = service.process_pending_documents(limit=args.limit)
+            
+            print(f"\nProcessed: {result['total']} documents")
+            print(f"  Successful: {result['success']}")
+            print(f"  Failed: {result['failed']}")
+        
+        else:
+            print("Specify --tender-id UUID or --pending")
+            sys.exit(1)
+            
+    finally:
+        db.close()
+
+
 def cmd_status(args):
     """Show scraper status."""
-    print("Tender Scraper Status")
+    print("Tender AI Platform Status")
     print("=" * 40)
     print(f"Playwright available: {PLAYWRIGHT_AVAILABLE}")
     print(f"Documents in memory: {document_store.count}")
     print(f"Memory usage: {document_store.size / 1024 / 1024:.2f} MB")
+    
+    # Check extraction dependencies
+    deps = {
+        "PyMuPDF (PDF)": "fitz",
+        "python-docx (DOCX)": "docx",
+        "openpyxl (XLSX)": "openpyxl",
+        "xlrd (XLS)": "xlrd",
+        "PaddleOCR": "paddleocr",
+    }
+    
+    print("\nExtraction dependencies:")
+    for name, module in deps.items():
+        try:
+            __import__(module)
+            print(f"  ✓ {name}")
+        except ImportError:
+            print(f"  ✗ {name} (not installed)")
 
 
 def main():
@@ -136,8 +209,27 @@ def main():
     )
     scrape_parser.set_defaults(func=cmd_scrape)
     
+    # Extract command
+    extract_parser = subparsers.add_parser("extract", help="Extract text from documents")
+    extract_parser.add_argument(
+        "--tender-id", "-t",
+        help="Tender UUID to process"
+    )
+    extract_parser.add_argument(
+        "--pending", "-p",
+        action="store_true",
+        help="Process all pending documents"
+    )
+    extract_parser.add_argument(
+        "--limit", "-l",
+        type=int,
+        default=50,
+        help="Max documents to process (default: 50)"
+    )
+    extract_parser.set_defaults(func=cmd_extract)
+    
     # Status command
-    status_parser = subparsers.add_parser("status", help="Show scraper status")
+    status_parser = subparsers.add_parser("status", help="Show platform status")
     status_parser.set_defaults(func=cmd_status)
     
     args = parser.parse_args()
