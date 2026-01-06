@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
 CLI for Tender AI Platform.
-Run scraping and extraction from command line.
+Run scraping, extraction, and analysis from command line.
 
 Usage:
     python -m app.cli scrape --date 2024-01-15
     python -m app.cli scrape --yesterday
     python -m app.cli extract --tender-id UUID
     python -m app.cli extract --pending
+    python -m app.cli analyze --tender-id UUID
+    python -m app.cli analyze --pending
     python -m app.cli status
 """
 
@@ -20,6 +22,7 @@ from uuid import UUID
 from app.services.scraper import run_scraper, PLAYWRIGHT_AVAILABLE
 from app.services.scraper_db import ScraperDBService, document_store
 from app.services.extraction_db import ExtractionDBService
+from app.services.ai_db import AIDBService
 from app.database import SessionLocal
 
 
@@ -148,8 +151,68 @@ def cmd_extract(args):
         db.close()
 
 
+def cmd_analyze(args):
+    """Run AI analysis command."""
+    print("AI Analysis Pipeline (DeepSeek)")
+    print("=" * 40)
+    
+    db = SessionLocal()
+    try:
+        service = AIDBService(db)
+        
+        if not service.is_configured():
+            print("ERROR: DeepSeek API key not configured.")
+            print("Set DEEPSEEK_API_KEY in your .env file")
+            sys.exit(1)
+        
+        if args.tender_id:
+            try:
+                tender_id = UUID(args.tender_id)
+            except ValueError:
+                print(f"ERROR: Invalid UUID: {args.tender_id}")
+                sys.exit(1)
+            
+            print(f"Analyzing tender: {tender_id}")
+            result = asyncio.run(service.analyze_tender(tender_id))
+            
+            if "error" in result:
+                print(f"ERROR: {result['error']}")
+                sys.exit(1)
+            
+            print(f"\nResults for: {result['reference']}")
+            print(f"  Documents analyzed: {result['documents_analyzed']}")
+            print(f"  Fields extracted: {result['fields_extracted']}")
+            
+            if result['errors']:
+                print(f"\nErrors:")
+                for err in result['errors']:
+                    print(f"  - {err}")
+        
+        elif args.pending:
+            print(f"Analyzing pending tenders (limit: {args.limit})")
+            result = asyncio.run(service.analyze_pending_tenders(limit=args.limit))
+            
+            print(f"\nResults:")
+            print(f"  Total pending: {result['total_pending']}")
+            print(f"  Analyzed: {result['analyzed']}")
+            
+            if result['errors']:
+                print(f"\nErrors ({len(result['errors'])}):")
+                for err in result['errors'][:5]:
+                    print(f"  - {err}")
+                if len(result['errors']) > 5:
+                    print(f"  ... and {len(result['errors']) - 5} more")
+        
+        else:
+            print("Specify --tender-id UUID or --pending")
+            sys.exit(1)
+            
+    finally:
+        db.close()
+
+
 def cmd_status(args):
-    """Show scraper status."""
+    """Show platform status."""
     print("Tender AI Platform Status")
     print("=" * 40)
     print(f"Playwright available: {PLAYWRIGHT_AVAILABLE}")
@@ -163,6 +226,7 @@ def cmd_status(args):
         "openpyxl (XLSX)": "openpyxl",
         "xlrd (XLS)": "xlrd",
         "PaddleOCR": "paddleocr",
+        "httpx (HTTP)": "httpx",
     }
     
     print("\nExtraction dependencies:")
@@ -172,6 +236,16 @@ def cmd_status(args):
             print(f"  ✓ {name}")
         except ImportError:
             print(f"  ✗ {name} (not installed)")
+    
+    # Check AI configuration
+    from app.config import settings
+    print("\nAI Configuration:")
+    if settings.deepseek_api_key:
+        print(f"  ✓ DeepSeek API configured")
+        print(f"    Model: {settings.deepseek_model}")
+    else:
+        print(f"  ✗ DeepSeek API key not set")
+        print("    Set DEEPSEEK_API_KEY in .env")
 
 
 def main():
@@ -227,6 +301,25 @@ def main():
         help="Max documents to process (default: 50)"
     )
     extract_parser.set_defaults(func=cmd_extract)
+    
+    # Analyze command
+    analyze_parser = subparsers.add_parser("analyze", help="Run AI analysis")
+    analyze_parser.add_argument(
+        "--tender-id", "-t",
+        help="Tender UUID to analyze"
+    )
+    analyze_parser.add_argument(
+        "--pending", "-p",
+        action="store_true",
+        help="Analyze all pending tenders"
+    )
+    analyze_parser.add_argument(
+        "--limit", "-l",
+        type=int,
+        default=10,
+        help="Max tenders to analyze (default: 10)"
+    )
+    analyze_parser.set_defaults(func=cmd_analyze)
     
     # Status command
     status_parser = subparsers.add_parser("status", help="Show platform status")
