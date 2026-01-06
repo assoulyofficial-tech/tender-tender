@@ -190,6 +190,64 @@ pip install paddleocr
 # Note: First OCR run will download models (~150MB)
 ```
 
+## AI Analysis Pipeline (Step 4)
+
+### Configuration
+
+Add your DeepSeek API key to `.env`:
+
+```bash
+DEEPSEEK_API_KEY=your-api-key-here
+DEEPSEEK_MODEL=deepseek-chat  # default
+```
+
+### Extracted Metadata (Avis Schema)
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `keywords_fr` | list | French keywords |
+| `keywords_ar` | list | Arabic keywords |
+| `keywords_en` | list | English keywords |
+| `eligibility_criteria` | list | Eligibility requirements |
+| `submission_requirements` | list | What to submit |
+| `technical_requirements` | list | Technical specs |
+| `required_documents` | list | Documents needed |
+| `submission_address` | string | Where to submit |
+| `opening_location` | string | Bid opening location |
+| `lots` | json | Multiple lots info |
+| `notes` | string | Additional notes |
+
+### Override Rules
+
+1. **Website deadline override**: Deadline from website takes precedence over document
+2. **Annex override**: Annex documents can override main document values
+
+### API Endpoints
+
+```bash
+# Check AI status
+curl http://localhost:8000/api/analysis/status
+
+# Analyze specific tender
+curl -X POST http://localhost:8000/api/analysis/tender/{uuid}
+
+# Analyze pending tenders
+curl -X POST "http://localhost:8000/api/analysis/pending?limit=10"
+```
+
+### CLI Usage
+
+```bash
+# Analyze specific tender
+python -m app.cli analyze --tender-id UUID
+
+# Analyze all pending tenders
+python -m app.cli analyze --pending --limit 10
+
+# Check status (shows AI config)
+python -m app.cli status
+```
+
 ## Project Structure
 
 ```
@@ -211,12 +269,15 @@ docs/backend/
 │   │   ├── scraper.py
 │   │   ├── scraper_db.py
 │   │   ├── extractor.py      # Text extraction
-│   │   └── extraction_db.py  # DB integration
+│   │   ├── extraction_db.py  # DB integration
+│   │   ├── ai_analyzer.py    # DeepSeek AI
+│   │   └── ai_db.py          # AI DB integration
 │   └── api/             # API routes
 │       ├── __init__.py
 │       ├── tenders.py
 │       ├── scraping.py
-│       └── extraction.py
+│       ├── extraction.py
+│       └── analysis.py
 ├── alembic/             # Migrations
 ├── alembic.ini
 ├── requirements.txt
@@ -228,5 +289,5 @@ docs/backend/
 - [x] Step 1: Database schema & API
 - [x] Step 2: Scraping module
 - [x] Step 3: Text extraction pipeline (OCR)
-- [ ] Step 4: AI analysis (DeepSeek)
+- [x] Step 4: AI analysis (DeepSeek) - Avis metadata
 - [ ] Step 5: Background job queue
