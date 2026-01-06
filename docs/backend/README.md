@@ -74,6 +74,41 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | `/docs` | GET | Swagger UI |
 | `/api/tenders` | GET | List tenders (paginated) |
 | `/api/tenders/{id}` | GET | Get tender details |
+| `/api/scraping/status` | GET | Scraper status & readiness |
+| `/api/scraping/trigger` | POST | Trigger manual scrape |
+| `/api/scraping/last-result` | GET | Get last scrape result |
+| `/api/scraping/clear-memory` | POST | Clear in-memory documents |
+| `/api/scraping/documents/{ref}` | GET | Get tender docs in memory |
+
+### Trigger Scraping
+
+```bash
+# Scrape yesterday's tenders
+curl -X POST http://localhost:8000/api/scraping/trigger \
+  -H "Content-Type: application/json" \
+  -d '{"category": "Fournitures"}'
+
+# Scrape specific date
+curl -X POST http://localhost:8000/api/scraping/trigger \
+  -H "Content-Type: application/json" \
+  -d '{"target_date": "2024-01-15", "category": "Fournitures"}'
+```
+
+### CLI Usage
+
+```bash
+# Scrape yesterday (default)
+python -m app.cli scrape
+
+# Scrape specific date and save to DB
+python -m app.cli scrape --date 2024-01-15 --save
+
+# Scrape with visible browser
+python -m app.cli scrape --visible
+
+# Check status
+python -m app.cli status
+```
 
 ### Query Parameters for `/api/tenders`
 
