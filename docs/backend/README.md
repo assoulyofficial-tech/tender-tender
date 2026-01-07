@@ -91,6 +91,11 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | `/api/deep-analysis/{id}/lots` | GET | Get lot items |
 | `/api/deep-analysis/{id}/execution` | GET | Get execution dates |
 | `/api/deep-analysis/{id}/provenance` | GET | Get field provenance |
+| `/api/ask/status` | GET | Check Ask AI config |
+| `/api/ask/tender/{id}/summary` | GET | Get tender context summary |
+| `/api/ask/tender/{id}/suggestions` | GET | Get suggested questions |
+| `/api/ask/tender/{id}` | POST | Ask a question about tender |
+| `/api/ask/tender/{id}/quick` | POST | Quick ask (no history) |
 
 ### Trigger Scraping
 
@@ -320,6 +325,89 @@ python -m app.cli deep-analyze --tender-id UUID --force
 python -m app.cli status
 ```
 
+## Ask AI Feature (Step 6)
+
+### Behavior
+
+- **Multilingual**: Accepts French, Moroccan Darija, Arabic, English
+- **Full context**: Uses all tender documents and analysis
+- **Source citations**: Every answer includes document citations
+
+### Supported Languages
+
+| Language | Code | Example Question |
+|----------|------|------------------|
+| French | `fr` | "Quels documents dois-je fournir ?" |
+| Darija | `ar-ma` | "شنو هي الوثائق اللي خاصني نقدم؟" |
+| Arabic | `ar` | "ما هي الوثائق المطلوبة؟" |
+| English | `en` | "What documents do I need to submit?" |
+
+### API Endpoints
+
+```bash
+# Check Ask AI status
+curl http://localhost:8000/api/ask/status
+
+# Get tender summary (documents available)
+curl http://localhost:8000/api/ask/tender/{uuid}/summary
+
+# Get suggested questions
+curl "http://localhost:8000/api/ask/tender/{uuid}/suggestions?language=fr"
+curl "http://localhost:8000/api/ask/tender/{uuid}/suggestions?language=ar-ma"
+
+# Ask a question
+curl -X POST http://localhost:8000/api/ask/tender/{uuid} \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Quels sont les documents requis ?"}'
+
+# Ask with conversation history
+curl -X POST http://localhost:8000/api/ask/tender/{uuid} \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "Et les délais ?",
+    "conversation_history": [
+      {"question": "Quels documents ?", "answer": "Les documents requis sont..."}
+    ]
+  }'
+
+# Quick ask (simple)
+curl -X POST "http://localhost:8000/api/ask/tender/{uuid}/quick?question=Quel%20budget"
+```
+
+### CLI Usage
+
+```bash
+# Ask a single question
+python -m app.cli ask --tender-id UUID --question "Quels documents ?"
+
+# Interactive mode (conversation)
+python -m app.cli ask --tender-id UUID
+
+# Example Darija question
+python -m app.cli ask --tender-id UUID --question "شنو هي الشروط؟"
+```
+
+### Response Format
+
+```json
+{
+  "answer": "Les documents requis sont: ...",
+  "language_detected": "fr",
+  "citations": [
+    {
+      "document_name": "RC_AO_2024.pdf",
+      "section": "Article 5",
+      "quote": "Le soumissionnaire doit fournir..."
+    }
+  ],
+  "confidence": 0.85,
+  "follow_up_suggestions": [
+    "Quel est le délai de soumission ?",
+    "Quelles sont les garanties demandées ?"
+  ]
+}
+```
+
 ## Project Structure
 
 ```
@@ -345,14 +433,17 @@ docs/backend/
 │   │   ├── ai_analyzer.py      # Avis AI (Step 4)
 │   │   ├── ai_db.py            # Avis DB integration
 │   │   ├── deep_analyzer.py    # Deep AI (Step 5)
-│   │   └── deep_analysis_db.py # Deep DB integration
+│   │   ├── deep_analysis_db.py # Deep DB integration
+│   │   ├── ask_ai.py           # Ask AI service (Step 6)
+│   │   └── ask_ai_db.py        # Ask AI DB integration
 │   └── api/             # API routes
 │       ├── __init__.py
 │       ├── tenders.py
 │       ├── scraping.py
 │       ├── extraction.py
 │       ├── analysis.py
-│       └── deep_analysis.py
+│       ├── deep_analysis.py
+│       └── ask_ai.py
 ├── alembic/             # Migrations
 ├── alembic.ini
 ├── requirements.txt
@@ -366,4 +457,5 @@ docs/backend/
 - [x] Step 3: Text extraction pipeline (OCR)
 - [x] Step 4: AI analysis (DeepSeek) - Avis metadata
 - [x] Step 5: Deep analysis (on-demand) - Universal fields, lots, execution dates
-- [ ] Step 6: Background job queue
+- [x] Step 6: Ask AI - Conversational Q&A (French, Darija)
+- [ ] Step 7: Background job queue
