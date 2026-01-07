@@ -1,15 +1,16 @@
 """
-Deep Analysis API endpoints.
+AI Process 2 — UNIVERSAL DEEP ANALYSIS API.
 
-On-demand AI analysis triggered when user opens a tender.
-No background execution - runs synchronously on request.
+User Shift — on click only.
+Extracts full operational, financial, and technical structure.
+This phase is expensive and must only run on user intent.
 """
 
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
-from typing import Optional, Any
+from typing import Optional, Any, List
 
 from app.database import get_db
 from app.services.deep_analysis_db import DeepAnalysisDBService
@@ -19,20 +20,23 @@ router = APIRouter(prefix="/deep-analysis", tags=["deep-analysis"])
 
 
 class DeepAnalysisStatus(BaseModel):
-    """Status of deep analysis for a tender."""
+    """Status of Universal Deep Analysis for a tender."""
     tender_id: str
     needs_analysis: bool
     has_analysis: bool
     message: str
+    process: str = "AI Process 2 - Universal Deep Analysis"
 
 
 class DeepAnalysisResult(BaseModel):
-    """Deep analysis result."""
+    """Universal Deep Analysis result."""
     status: str
+    process: str = "AI Process 2 - Universal Deep Analysis"
     tender_id: str
     reference: Optional[str] = None
     fields_extracted: int = 0
     lots_found: int = 0
+    items_found: int = 0
     has_execution_dates: bool = False
     confidence_score: float = 0.0
     analysis: Optional[dict] = None
