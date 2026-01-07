@@ -11,6 +11,7 @@ Usage:
     python -m app.cli analyze --tender-id UUID
     python -m app.cli analyze --pending
     python -m app.cli deep-analyze --tender-id UUID
+    python -m app.cli ask --tender-id UUID --question "Quels documents?"
     python -m app.cli status
 """
 
@@ -25,6 +26,7 @@ from app.services.scraper_db import ScraperDBService, document_store
 from app.services.extraction_db import ExtractionDBService
 from app.services.ai_db import AIDBService
 from app.services.deep_analysis_db import DeepAnalysisDBService
+from app.services.ask_ai_db import AskAIDBService
 from app.database import SessionLocal
 
 
@@ -284,6 +286,125 @@ def cmd_deep_analyze(args):
         db.close()
 
 
+def cmd_ask(args):
+    """Ask a question about a tender."""
+    print("Ask AI - Tender Q&A")
+    print("=" * 40)
+    
+    db = SessionLocal()
+    try:
+        service = AskAIDBService(db)
+        
+        if not service.is_configured():
+            print("ERROR: DeepSeek API key not configured.")
+            print("Set DEEPSEEK_API_KEY in your .env file")
+            sys.exit(1)
+        
+        try:
+            tender_id = UUID(args.tender_id)
+        except ValueError:
+            print(f"ERROR: Invalid UUID: {args.tender_id}")
+            sys.exit(1)
+        
+        # Get tender summary
+        summary = service.get_tender_summary(tender_id)
+        if "error" in summary:
+            print(f"ERROR: {summary['error']}")
+            sys.exit(1)
+        
+        print(f"Tender: {summary['reference']}")
+        print(f"Documents: {summary['document_count']}")
+        print(f"Has analysis: {summary['has_analysis']}")
+        print("")
+        
+        if not summary['can_ask']:
+            print("ERROR: Cannot ask questions - no documents or AI not configured")
+            sys.exit(1)
+        
+        question = args.question
+        if not question:
+            # Interactive mode
+            print("Enter your question (or 'quit' to exit):")
+            print("Supports: French, Moroccan Darija, Arabic, English")
+            print("")
+            
+            conversation_history = []
+            
+            while True:
+                try:
+                    question = input("You: ").strip()
+                except EOFError:
+                    break
+                
+                if not question or question.lower() in ['quit', 'exit', 'q']:
+                    break
+                
+                result = asyncio.run(service.ask_about_tender(
+                    tender_id=tender_id,
+                    question=question,
+                    conversation_history=conversation_history
+                ))
+                
+                if "error" in result:
+                    print(f"Error: {result['error']}")
+                    continue
+                
+                print(f"\nAI ({result['language_detected']}): {result['answer']}")
+                
+                if result['citations']:
+                    print("\nSources:")
+                    for cit in result['citations']:
+                        loc = f", {cit['section']}" if cit.get('section') else ""
+                        print(f"  - {cit['document_name']}{loc}")
+                
+                if result['follow_up_suggestions']:
+                    print("\nSuggestions:")
+                    for sug in result['follow_up_suggestions'][:3]:
+                        print(f"  → {sug}")
+                
+                print("")
+                
+                # Add to history
+                conversation_history.append({
+                    "question": question,
+                    "answer": result['answer']
+                })
+        else:
+            # Single question mode
+            print(f"Question: {question}")
+            print("")
+            
+            result = asyncio.run(service.ask_about_tender(
+                tender_id=tender_id,
+                question=question
+            ))
+            
+            if "error" in result:
+                print(f"ERROR: {result['error']}")
+                sys.exit(1)
+            
+            print(f"Language: {result['language_detected']}")
+            print(f"Confidence: {result['confidence']:.0%}")
+            print("")
+            print(f"Answer:\n{result['answer']}")
+            
+            if result['citations']:
+                print("\nSources:")
+                for cit in result['citations']:
+                    loc = f", Section: {cit['section']}" if cit.get('section') else ""
+                    print(f"  - {cit['document_name']}{loc}")
+                    if cit.get('quote'):
+                        print(f"    \"{cit['quote'][:100]}...\"")
+            
+            if result['follow_up_suggestions']:
+                print("\nSuggested follow-up questions:")
+                for sug in result['follow_up_suggestions']:
+                    print(f"  → {sug}")
+                    
+    finally:
+        db.close()
+
+
 def cmd_status(args):
     """Show platform status."""
     print("Tender AI Platform Status")
@@ -312,11 +433,13 @@ def cmd_status(args):
     
     # Check AI configuration
     from app.config import settings
-    print("\nAI Configuration:")
+    print("\nAI Features:")
     if settings.deepseek_api_key:
         print(f"  ✓ DeepSeek API configured")
         print(f"    Model: {settings.deepseek_model}")
+        print(f"  ✓ Avis Analysis available")
         print(f"  ✓ Deep Analysis available")
+        print(f"  ✓ Ask AI available (French, Darija)")
     else:
         print(f"  ✗ DeepSeek API key not set")
         print("    Set DEEPSEEK_API_KEY in .env")
@@ -408,6 +531,19 @@ def main():
         help="Force re-analysis even if already analyzed"
     )
     deep_analyze_parser.set_defaults(func=cmd_deep_analyze)
+    
+    # Ask AI command
+    ask_parser = subparsers.add_parser("ask", help="Ask questions about a tender")
+    ask_parser.add_argument(
+        "--tender-id", "-t",
+        required=True,
+        help="Tender UUID to ask about"
+    )
+    ask_parser.add_argument(
+        "--question", "-q",
+        help="Question to ask (omit for interactive mode)"
+    )
+    ask_parser.set_defaults(func=cmd_ask)
     
     # Status command
     status_parser = subparsers.add_parser("status", help="Show platform status")
