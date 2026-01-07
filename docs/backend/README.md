@@ -82,6 +82,15 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | `/api/extraction/trigger` | POST | Trigger text extraction |
 | `/api/extraction/tender/{id}` | POST | Extract for specific tender |
 | `/api/extraction/pending` | POST | Process pending documents |
+| `/api/analysis/status` | GET | Check AI analysis config |
+| `/api/analysis/tender/{id}` | POST | Run Avis analysis |
+| `/api/analysis/pending` | POST | Analyze pending tenders |
+| `/api/deep-analysis/status/{id}` | GET | Check deep analysis status |
+| `/api/deep-analysis/{id}` | GET | Get deep analysis results |
+| `/api/deep-analysis/{id}` | POST | Trigger deep analysis (on-demand) |
+| `/api/deep-analysis/{id}/lots` | GET | Get lot items |
+| `/api/deep-analysis/{id}/execution` | GET | Get execution dates |
+| `/api/deep-analysis/{id}/provenance` | GET | Get field provenance |
 
 ### Trigger Scraping
 
@@ -248,6 +257,69 @@ python -m app.cli analyze --pending --limit 10
 python -m app.cli status
 ```
 
+## Deep Analysis Pipeline (Step 5)
+
+### Trigger
+
+Deep analysis is triggered **on-demand** when a user opens a tender (not background).
+
+### Extracted Data (Universal Fields Schema)
+
+| Category | Fields |
+|----------|--------|
+| **Contract** | contract_type, procedure_type, award_criteria |
+| **Financial** | payment_terms, advance_payment, retention_percentage, currency |
+| **Guarantees** | bid_guarantee, performance_guarantee, advance_guarantee |
+| **Technical** | technical_specifications, quality_standards, environmental_requirements |
+| **Eligibility** | minimum_experience_years, required_certifications, required_equipment, minimum_turnover |
+| **Lots** | lot_number, title, description, quantity, unit, estimated_value |
+| **Execution** | start_date, end_date, duration_days, duration_months, milestones |
+| **Contact** | contracting_authority, contact_name, contact_email, contact_phone |
+
+### Rules
+
+1. **Annex reconciliation**: Annex documents can override main document values
+2. **Field provenance tracking**: Each field tracks its source document, confidence, and location
+3. **No background execution**: Runs synchronously when user views tender
+
+### API Endpoints
+
+```bash
+# Check if tender needs deep analysis
+curl http://localhost:8000/api/deep-analysis/status/{uuid}
+
+# Get existing deep analysis
+curl http://localhost:8000/api/deep-analysis/{uuid}
+
+# Trigger deep analysis (on-demand)
+curl -X POST http://localhost:8000/api/deep-analysis/{uuid}
+
+# Force re-analysis
+curl -X POST "http://localhost:8000/api/deep-analysis/{uuid}?force=true"
+
+# Get lot items
+curl http://localhost:8000/api/deep-analysis/{uuid}/lots
+
+# Get execution dates
+curl http://localhost:8000/api/deep-analysis/{uuid}/execution
+
+# Get field provenance
+curl http://localhost:8000/api/deep-analysis/{uuid}/provenance
+```
+
+### CLI Usage
+
+```bash
+# Deep analyze a tender (on-demand)
+python -m app.cli deep-analyze --tender-id UUID
+
+# Force re-analysis
+python -m app.cli deep-analyze --tender-id UUID --force
+
+# Check status (shows deep analysis config)
+python -m app.cli status
+```
+
 ## Project Structure
 
 ```
@@ -268,16 +340,19 @@ docs/backend/
 │   │   ├── __init__.py
 │   │   ├── scraper.py
 │   │   ├── scraper_db.py
-│   │   ├── extractor.py      # Text extraction
-│   │   ├── extraction_db.py  # DB integration
-│   │   ├── ai_analyzer.py    # DeepSeek AI
-│   │   └── ai_db.py          # AI DB integration
+│   │   ├── extractor.py        # Text extraction
+│   │   ├── extraction_db.py    # Extraction DB
+│   │   ├── ai_analyzer.py      # Avis AI (Step 4)
+│   │   ├── ai_db.py            # Avis DB integration
+│   │   ├── deep_analyzer.py    # Deep AI (Step 5)
+│   │   └── deep_analysis_db.py # Deep DB integration
 │   └── api/             # API routes
 │       ├── __init__.py
 │       ├── tenders.py
 │       ├── scraping.py
 │       ├── extraction.py
-│       └── analysis.py
+│       ├── analysis.py
+│       └── deep_analysis.py
 ├── alembic/             # Migrations
 ├── alembic.ini
 ├── requirements.txt
@@ -290,4 +365,5 @@ docs/backend/
 - [x] Step 2: Scraping module
 - [x] Step 3: Text extraction pipeline (OCR)
 - [x] Step 4: AI analysis (DeepSeek) - Avis metadata
-- [ ] Step 5: Background job queue
+- [x] Step 5: Deep analysis (on-demand) - Universal fields, lots, execution dates
+- [ ] Step 6: Background job queue
