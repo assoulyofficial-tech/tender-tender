@@ -10,6 +10,7 @@ Usage:
     python -m app.cli extract --pending
     python -m app.cli analyze --tender-id UUID
     python -m app.cli analyze --pending
+    python -m app.cli deep-analyze --tender-id UUID
     python -m app.cli status
 """
 
@@ -23,6 +24,7 @@ from app.services.scraper import run_scraper, PLAYWRIGHT_AVAILABLE
 from app.services.scraper_db import ScraperDBService, document_store
 from app.services.extraction_db import ExtractionDBService
 from app.services.ai_db import AIDBService
+from app.services.deep_analysis_db import DeepAnalysisDBService
 from app.database import SessionLocal
 
 
@@ -211,6 +213,77 @@ def cmd_analyze(args):
         db.close()
 
 
+def cmd_deep_analyze(args):
+    """Run deep analysis command (on-demand)."""
+    print("Deep Analysis Pipeline (DeepSeek)")
+    print("=" * 40)
+    print("Note: Deep analysis is normally triggered on-demand when user opens a tender.")
+    print("")
+    
+    db = SessionLocal()
+    try:
+        service = DeepAnalysisDBService(db)
+        
+        if not service.is_configured():
+            print("ERROR: DeepSeek API key not configured.")
+            print("Set DEEPSEEK_API_KEY in your .env file")
+            sys.exit(1)
+        
+        if not args.tender_id:
+            print("ERROR: Deep analysis requires --tender-id UUID")
+            print("(No batch mode - this is an on-demand analysis)")
+            sys.exit(1)
+        
+        try:
+            tender_id = UUID(args.tender_id)
+        except ValueError:
+            print(f"ERROR: Invalid UUID: {args.tender_id}")
+            sys.exit(1)
+        
+        # Check if already analyzed
+        if not args.force:
+            existing = service.get_deep_analysis(tender_id)
+            if existing:
+                print(f"Tender already has deep analysis.")
+                print(f"  Lots found: {len(existing.get('lots', []))}")
+                print(f"  Has execution dates: {existing.get('execution_dates') is not None}")
+                print(f"  Confidence: {existing.get('confidence_score', 0):.2f}")
+                print("\nUse --force to re-analyze.")
+                return
+        
+        print(f"Running deep analysis for: {tender_id}")
+        result = asyncio.run(service.perform_deep_analysis(tender_id))
+        
+        if "error" in result:
+            print(f"ERROR: {result['error']}")
+            sys.exit(1)
+        
+        print(f"\nResults for: {result.get('reference', tender_id)}")
+        print(f"  Fields extracted: {result['fields_extracted']}")
+        print(f"  Lots found: {result['lots_found']}")
+        print(f"  Has execution dates: {result['has_execution_dates']}")
+        print(f"  Confidence score: {result['confidence_score']:.2f}")
+        
+        # Show some details
+        analysis = result.get('analysis', {})
+        if analysis.get('contract_type'):
+            print(f"\n  Contract type: {analysis['contract_type']}")
+        if analysis.get('procedure_type'):
+            print(f"  Procedure type: {analysis['procedure_type']}")
+        if analysis.get('award_criteria'):
+            print(f"  Award criteria: {analysis['award_criteria']}")
+        
+        if result['lots_found'] > 0:
+            print(f"\n  Lots:")
+            for lot in analysis.get('lots', [])[:5]:
+                print(f"    - Lot {lot.get('lot_number', '?')}: {lot.get('title', 'N/A')}")
+            if result['lots_found'] > 5:
+                print(f"    ... and {result['lots_found'] - 5} more")
+                
+    finally:
+        db.close()
+
+
 def cmd_status(args):
     """Show platform status."""
     print("Tender AI Platform Status")
@@ -243,6 +316,7 @@ def cmd_status(args):
     if settings.deepseek_api_key:
         print(f"  ✓ DeepSeek API configured")
         print(f"    Model: {settings.deepseek_model}")
+        print(f"  ✓ Deep Analysis available")
     else:
         print(f"  ✗ DeepSeek API key not set")
         print("    Set DEEPSEEK_API_KEY in .env")
@@ -303,7 +377,7 @@ def main():
     extract_parser.set_defaults(func=cmd_extract)
     
     # Analyze command
-    analyze_parser = subparsers.add_parser("analyze", help="Run AI analysis")
+    analyze_parser = subparsers.add_parser("analyze", help="Run AI analysis (Avis)")
     analyze_parser.add_argument(
         "--tender-id", "-t",
         help="Tender UUID to analyze"
@@ -320,6 +394,20 @@ def main():
         help="Max tenders to analyze (default: 10)"
     )
     analyze_parser.set_defaults(func=cmd_analyze)
+    
+    # Deep Analyze command
+    deep_analyze_parser = subparsers.add_parser("deep-analyze", help="Run deep analysis (on-demand)")
+    deep_analyze_parser.add_argument(
+        "--tender-id", "-t",
+        required=True,
+        help="Tender UUID to deep analyze"
+    )
+    deep_analyze_parser.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Force re-analysis even if already analyzed"
+    )
+    deep_analyze_parser.set_defaults(func=cmd_deep_analyze)
     
     # Status command
     status_parser = subparsers.add_parser("status", help="Show platform status")
