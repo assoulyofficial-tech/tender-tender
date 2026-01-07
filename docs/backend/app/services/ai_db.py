@@ -1,321 +1,347 @@
 """
-Database integration for AI analysis.
-Stores extracted metadata in tender_fields with provenance tracking.
+AI Process 1 Database Service.
+
+Integrates Avis Metadata Extraction with database.
+Handles document classification, annex override, and website deadline override.
 """
 
 import json
-from datetime import datetime
-from uuid import UUID
 from typing import Optional
-from sqlalchemy.orm import Session
+from uuid import UUID
+from datetime import datetime
+from dataclasses import asdict
 
-from app.models import (
-    Tender,
-    TenderDocument,
-    TenderField,
-    ProcessingState,
-    FieldSource,
-    ProcessingStatus,
-    DocumentType,
+from sqlalchemy.orm import Session
+from sqlalchemy import and_
+
+from app.models.tender import (
+    Tender, TenderDocument, TenderField, ProcessingState,
+    FieldSource, OCRStatus
 )
-from app.services.ai_analyzer import DeepSeekAnalyzer, AvisMetadata, AnalysisResult
+from app.services.ai_analyzer import (
+    AvisExtractor, AvisMetadata, DocumentType
+)
 
 
 class AIDBService:
-    """Service to run AI analysis and store results."""
+    """
+    AI Process 1 - Avis Metadata Extraction with DB integration.
+    
+    Night Shift operation for minimal cost.
+    Implements:
+    - Document classification by keywords
+    - Annex override logic
+    - Website deadline override
+    - Full provenance tracking
+    """
     
     def __init__(self, db: Session):
         self.db = db
-        self.analyzer = DeepSeekAnalyzer()
+        self.extractor = AvisExtractor()
     
     def is_configured(self) -> bool:
-        """Check if AI is properly configured."""
-        return self.analyzer.is_configured()
+        """Check if AI is configured."""
+        return self.extractor.is_configured()
     
-    async def analyze_tender(self, tender_id: UUID) -> dict:
+    async def analyze_tender(
+        self,
+        tender_id: UUID,
+        website_deadline: Optional[dict] = None
+    ) -> dict:
         """
-        Analyze all documents for a tender and store extracted metadata.
-        
-        Implements:
-        - Annex override logic: Annex documents override main document values
-        - Website deadline override: Website deadline takes precedence
+        Extract Avis metadata for a tender.
         
         Args:
             tender_id: Tender UUID
+            website_deadline: Optional {date, time} from website
             
         Returns:
-            Analysis summary
+            Analysis summary with provenance
         """
         tender = self.db.query(Tender).filter(Tender.id == tender_id).first()
         if not tender:
-            return {"error": f"Tender not found: {tender_id}"}
+            return {"error": "Tender not found"}
+        
+        # Get documents with extracted text
+        documents = self.db.query(TenderDocument).filter(
+            and_(
+                TenderDocument.tender_id == tender_id,
+                TenderDocument.extracted_text.isnot(None),
+                TenderDocument.ocr_status == OCRStatus.COMPLETED
+            )
+        ).all()
+        
+        if not documents:
+            return {"error": "No extracted text available"}
         
         if not self.is_configured():
-            return {"error": "DeepSeek API key not configured. Set DEEPSEEK_API_KEY in .env"}
+            return {"error": "DeepSeek API key not configured"}
+        
+        # Prepare documents for extraction
+        doc_list = []
+        for doc in documents:
+            # Classify by content keywords
+            first_page = (doc.extracted_text or "")[:3000]
+            doc_type = self.extractor.classify_document(first_page)
+            
+            doc_list.append({
+                "id": str(doc.id),
+                "filename": doc.filename,
+                "content": doc.extracted_text,
+                "doc_type": doc_type,
+                "position": len(doc_list)  # For sorting
+            })
+        
+        # Build website deadline if available from tender
+        if not website_deadline and tender.deadline:
+            website_deadline = {
+                "date": tender.deadline.strftime("%d/%m/%Y"),
+                "time": tender.deadline.strftime("%H:%M")
+            }
+        
+        # Extract metadata
+        try:
+            metadata = await self.extractor.extract_metadata(
+                documents=doc_list,
+                website_deadline=website_deadline
+            )
+        except Exception as e:
+            return {"error": f"Extraction failed: {str(e)}"}
+        
+        # Store results
+        fields_stored = self._store_metadata(tender_id, metadata, doc_list)
         
         # Update processing state
-        state = tender.processing_state
-        if state:
-            state.status = ProcessingStatus.ANALYZING
-            state.current_step = "ai_extraction"
-            state.analysis_started_at = datetime.utcnow()
-            self.db.commit()
+        self._update_processing_state(tender_id)
         
-        results = {
-            "tender_id": str(tender_id),
+        return {
+            "status": "completed",
             "reference": tender.reference,
-            "documents_analyzed": 0,
-            "fields_extracted": 0,
-            "errors": [],
+            "documents_analyzed": len(doc_list),
+            "fields_extracted": fields_stored,
+            "errors": []
         }
-        
-        # Get website deadline (takes precedence)
-        website_deadline = tender.deadline
-        
-        # Process documents in order: main documents first, then annexes
-        # Annexes can override main document values
-        main_docs = [d for d in tender.documents if d.file_type != DocumentType.ANNEXE]
-        annex_docs = [d for d in tender.documents if d.file_type == DocumentType.ANNEXE]
-        
-        combined_metadata = AvisMetadata()
-        
-        # Process main documents
-        for doc in main_docs:
-            if not doc.extracted_text:
-                continue
-            
-            doc_result = await self._analyze_document(
-                doc,
-                website_deadline=website_deadline,
-                is_annex=False
-            )
-            
-            if doc_result.success:
-                self._merge_metadata(combined_metadata, doc_result.metadata)
-                results["documents_analyzed"] += 1
-            else:
-                results["errors"].append(f"{doc.filename}: {doc_result.error}")
-        
-        # Process annexes (can override)
-        for doc in annex_docs:
-            if not doc.extracted_text:
-                continue
-            
-            doc_result = await self._analyze_document(
-                doc,
-                website_deadline=website_deadline,
-                is_annex=True
-            )
-            
-            if doc_result.success:
-                # Annex values override (merge with priority)
-                self._merge_metadata(combined_metadata, doc_result.metadata, override=True)
-                results["documents_analyzed"] += 1
-            else:
-                results["errors"].append(f"{doc.filename}: {doc_result.error}")
-        
-        # Store extracted fields
-        fields_count = self._store_metadata(tender_id, combined_metadata)
-        results["fields_extracted"] = fields_count
-        
-        # Update tender with extracted data
-        self._update_tender(tender, combined_metadata, website_deadline)
-        
-        # Update processing state
-        if state:
-            state.analysis_completed_at = datetime.utcnow()
-            state.status = ProcessingStatus.COMPLETED if not results["errors"] else ProcessingStatus.FAILED
-            state.progress = 100.0
-            self.db.commit()
-        
-        return results
     
-    async def _analyze_document(
+    def _store_metadata(
         self,
-        doc: TenderDocument,
-        website_deadline: Optional[datetime],
-        is_annex: bool
-    ) -> AnalysisResult:
-        """Analyze a single document."""
-        return await self.analyzer.analyze_document(
-            document_text=doc.extracted_text,
-            website_deadline=website_deadline,
-            is_annex=is_annex
+        tender_id: UUID,
+        metadata: AvisMetadata,
+        documents: list[dict]
+    ) -> int:
+        """Store Avis metadata with provenance tracking."""
+        fields_stored = 0
+        
+        # Get primary document ID
+        primary_doc_id = None
+        for doc in documents:
+            if doc.get("doc_type") == DocumentType.AVIS:
+                primary_doc_id = doc["id"]
+                break
+        if not primary_doc_id and documents:
+            primary_doc_id = documents[0]["id"]
+        
+        # Store complete metadata as JSON
+        metadata_dict = self.extractor.to_dict(metadata)
+        self._store_field(
+            tender_id=tender_id,
+            field_name="avis_metadata",
+            field_value=json.dumps(metadata_dict, default=str),
+            field_type="json",
+            source=FieldSource.AI,
+            confidence=0.9,
+            document_id=primary_doc_id,
+            source_location="avis_extraction"
         )
-    
-    def _merge_metadata(
-        self,
-        target: AvisMetadata,
-        source: AvisMetadata,
-        override: bool = False
-    ):
-        """
-        Merge source metadata into target.
+        fields_stored += 1
         
-        Args:
-            target: Target metadata to update
-            source: Source metadata to merge from
-            override: If True, source values always override target
-        """
-        # Simple fields - override if set and (empty target or override flag)
-        simple_fields = [
-            'reference', 'title', 'organization', 'publication_date',
-            'deadline', 'opening_date', 'budget_estimate', 'caution_amount',
-            'category', 'submission_address', 'opening_location', 'notes'
+        # Store individual provenance fields
+        provenance_fields = [
+            ("reference_tender", metadata.reference_tender),
+            ("tender_type", metadata.tender_type),
+            ("issuing_institution", metadata.issuing_institution),
+            ("folder_opening_location", metadata.folder_opening_location),
+            ("subject", metadata.subject),
+            ("total_estimated_value", metadata.total_estimated_value),
         ]
         
-        for field in simple_fields:
-            source_val = getattr(source, field)
-            target_val = getattr(target, field)
-            
-            if source_val is not None:
-                if target_val is None or override:
-                    setattr(target, field, source_val)
+        for field_name, prov_field in provenance_fields:
+            if prov_field and prov_field.value:
+                doc_id = self._find_doc_id(prov_field.source_document, documents) or primary_doc_id
+                self._store_field(
+                    tender_id=tender_id,
+                    field_name=f"avis_{field_name}",
+                    field_value=str(prov_field.value),
+                    field_type="text",
+                    source=FieldSource.AI,
+                    confidence=0.9,
+                    document_id=doc_id,
+                    source_location=prov_field.source_document
+                )
+                fields_stored += 1
         
-        # List fields - extend (avoid duplicates)
-        list_fields = [
-            'keywords_fr', 'keywords_ar', 'keywords_en',
-            'eligibility_criteria', 'submission_requirements',
-            'technical_requirements', 'required_documents'
-        ]
-        
-        for field in list_fields:
-            source_list = getattr(source, field, [])
-            target_list = getattr(target, field, [])
-            
-            for item in source_list:
-                if item not in target_list:
-                    target_list.append(item)
-        
-        # Lots - extend
-        for lot in source.lots:
-            if lot not in target.lots:
-                target.lots.append(lot)
-    
-    def _store_metadata(self, tender_id: UUID, metadata: AvisMetadata) -> int:
-        """Store extracted metadata as TenderField records."""
-        # Delete existing AI-extracted fields
-        self.db.query(TenderField).filter(
-            TenderField.tender_id == tender_id,
-            TenderField.source == FieldSource.AI
-        ).delete()
-        
-        count = 0
-        
-        # Helper to create field
-        def add_field(name: str, value, field_type: str = "text", confidence: float = 0.85):
-            nonlocal count
-            if value is None:
-                return
-            if isinstance(value, list) and len(value) == 0:
-                return
-            
-            str_value = json.dumps(value) if isinstance(value, (list, dict)) else str(value)
-            
-            field = TenderField(
+        # Store submission deadline
+        if metadata.submission_deadline.date.value:
+            doc_id = self._find_doc_id(
+                metadata.submission_deadline.date.source_document, documents
+            ) or primary_doc_id
+            self._store_field(
                 tender_id=tender_id,
-                field_name=name,
-                field_value=str_value,
-                field_type=field_type,
+                field_name="avis_submission_deadline_date",
+                field_value=metadata.submission_deadline.date.value,
+                field_type="date",
                 source=FieldSource.AI,
-                confidence=confidence,
-                is_verified=False
+                confidence=0.95 if metadata.submission_deadline.date.source_document == "Website" else 0.9,
+                document_id=doc_id,
+                source_location=metadata.submission_deadline.date.source_document
             )
-            self.db.add(field)
-            count += 1
+            fields_stored += 1
         
-        # Store all fields
-        add_field("keywords_fr", metadata.keywords_fr, "list")
-        add_field("keywords_ar", metadata.keywords_ar, "list")
-        add_field("keywords_en", metadata.keywords_en, "list")
-        add_field("eligibility_criteria", metadata.eligibility_criteria, "list")
-        add_field("submission_requirements", metadata.submission_requirements, "list")
-        add_field("technical_requirements", metadata.technical_requirements, "list")
-        add_field("required_documents", metadata.required_documents, "list")
-        add_field("submission_address", metadata.submission_address)
-        add_field("opening_location", metadata.opening_location)
-        add_field("lots", metadata.lots, "json")
-        add_field("notes", metadata.notes)
+        if metadata.submission_deadline.time.value:
+            self._store_field(
+                tender_id=tender_id,
+                field_name="avis_submission_deadline_time",
+                field_value=metadata.submission_deadline.time.value,
+                field_type="text",
+                source=FieldSource.AI,
+                confidence=0.95 if metadata.submission_deadline.time.source_document == "Website" else 0.9,
+                document_id=primary_doc_id,
+                source_location=metadata.submission_deadline.time.source_document
+            )
+            fields_stored += 1
+        
+        # Store lots
+        if metadata.lots:
+            self._store_field(
+                tender_id=tender_id,
+                field_name="avis_lots",
+                field_value=json.dumps([asdict(lot) for lot in metadata.lots], default=str),
+                field_type="json",
+                source=FieldSource.AI,
+                confidence=0.9,
+                document_id=primary_doc_id,
+                source_location="avis_extraction"
+            )
+            fields_stored += 1
+        
+        # Store keywords (CRITICAL for search)
+        if metadata.keywords:
+            self._store_field(
+                tender_id=tender_id,
+                field_name="keywords_fr",
+                field_value=json.dumps(metadata.keywords.keywords_fr),
+                field_type="list",
+                source=FieldSource.AI,
+                confidence=0.85,
+                document_id=primary_doc_id,
+                source_location="avis_extraction"
+            )
+            self._store_field(
+                tender_id=tender_id,
+                field_name="keywords_eng",
+                field_value=json.dumps(metadata.keywords.keywords_eng),
+                field_type="list",
+                source=FieldSource.AI,
+                confidence=0.85,
+                document_id=primary_doc_id,
+                source_location="avis_extraction"
+            )
+            self._store_field(
+                tender_id=tender_id,
+                field_name="keywords_ar",
+                field_value=json.dumps(metadata.keywords.keywords_ar),
+                field_type="list",
+                source=FieldSource.AI,
+                confidence=0.85,
+                document_id=primary_doc_id,
+                source_location="avis_extraction"
+            )
+            fields_stored += 3
         
         self.db.commit()
-        return count
+        return fields_stored
     
-    def _update_tender(
+    def _find_doc_id(self, source_document: Optional[str], documents: list[dict]) -> Optional[str]:
+        """Find document ID by source name."""
+        if not source_document or source_document == "Website":
+            return None
+        
+        for doc in documents:
+            if source_document.lower() in doc["filename"].lower():
+                return doc["id"]
+        
+        return None
+    
+    def _store_field(
         self,
-        tender: Tender,
-        metadata: AvisMetadata,
-        website_deadline: Optional[datetime]
+        tender_id: UUID,
+        field_name: str,
+        field_value: str,
+        field_type: str,
+        source: FieldSource,
+        confidence: float,
+        document_id: Optional[str],
+        source_location: Optional[str]
     ):
-        """Update tender record with extracted data."""
-        # Only update if we got new info and it wasn't already set
-        if metadata.title and not tender.title:
-            tender.title = metadata.title
+        """Store or update a field with provenance."""
+        existing = self.db.query(TenderField).filter(
+            and_(
+                TenderField.tender_id == tender_id,
+                TenderField.field_name == field_name
+            )
+        ).first()
         
-        if metadata.organization and not tender.organization:
-            tender.organization = metadata.organization
+        if existing:
+            existing.field_value = field_value
+            existing.field_type = field_type
+            existing.source = source
+            existing.confidence = confidence
+            existing.source_location = source_location
+            existing.updated_at = datetime.utcnow()
+            if document_id:
+                existing.document_id = UUID(document_id)
+        else:
+            field = TenderField(
+                tender_id=tender_id,
+                document_id=UUID(document_id) if document_id else None,
+                field_name=field_name,
+                field_value=field_value,
+                field_type=field_type,
+                source=source,
+                confidence=confidence,
+                source_location=source_location
+            )
+            self.db.add(field)
+    
+    def _update_processing_state(self, tender_id: UUID):
+        """Update processing state."""
+        state = self.db.query(ProcessingState).filter(
+            ProcessingState.tender_id == tender_id
+        ).first()
         
-        if metadata.budget_estimate and not tender.budget_estimate:
-            tender.budget_estimate = metadata.budget_estimate
+        if state:
+            state.ai_analyzed = True
+            state.ai_analyzed_at = datetime.utcnow()
+            state.updated_at = datetime.utcnow()
         
-        if metadata.caution_amount and not tender.caution_amount:
-            tender.caution_amount = metadata.caution_amount
-        
-        # Deadline: Website takes precedence, then AI extraction
-        if website_deadline:
-            tender.deadline = website_deadline
-        elif metadata.deadline and not tender.deadline:
-            try:
-                tender.deadline = datetime.strptime(metadata.deadline, "%Y-%m-%d")
-            except ValueError:
-                pass
-        
-        # Opening date from AI if not set
-        if metadata.opening_date and not tender.opening_date:
-            try:
-                tender.opening_date = datetime.strptime(metadata.opening_date, "%Y-%m-%d")
-            except ValueError:
-                pass
-        
-        tender.updated_at = datetime.utcnow()
         self.db.commit()
     
     async def analyze_pending_tenders(self, limit: int = 10) -> dict:
-        """
-        Analyze tenders that have extracted text but no AI analysis.
-        
-        Args:
-            limit: Maximum tenders to process
-            
-        Returns:
-            Summary of results
-        """
-        # Find tenders with documents that have text but no AI fields
-        tenders_with_text = (
-            self.db.query(Tender)
-            .join(TenderDocument)
-            .filter(TenderDocument.extracted_text.isnot(None))
-            .limit(limit)
-            .all()
-        )
-        
-        # Filter to those without AI analysis
-        pending = []
-        for tender in tenders_with_text:
-            has_ai_fields = self.db.query(TenderField).filter(
-                TenderField.tender_id == tender.id,
-                TenderField.source == FieldSource.AI
-            ).first()
-            
-            if not has_ai_fields:
-                pending.append(tender)
+        """Analyze tenders with extracted text but no AI analysis."""
+        # Find pending tenders
+        pending = self.db.query(Tender).join(ProcessingState).filter(
+            and_(
+                ProcessingState.text_extracted == True,
+                ProcessingState.ai_analyzed == False
+            )
+        ).limit(limit).all()
         
         results = {
             "total_pending": len(pending),
             "analyzed": 0,
-            "errors": [],
+            "errors": []
         }
         
-        for tender in pending[:limit]:
+        for tender in pending:
             try:
                 result = await self.analyze_tender(tender.id)
                 if "error" not in result:

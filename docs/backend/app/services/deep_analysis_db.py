@@ -1,12 +1,12 @@
 """
-Deep Analysis Database Service.
+AI Process 2 Database Service - Universal Deep Analysis.
 
-Handles on-demand deep analysis when user views a tender.
-Implements annex reconciliation and field provenance tracking.
+On-demand analysis when user opens a tender.
+Extracts full operational, financial, and technical structure.
 """
 
 import json
-from typing import Optional, Any
+from typing import Optional
 from uuid import UUID
 from datetime import datetime
 from dataclasses import asdict
@@ -16,19 +16,24 @@ from sqlalchemy import and_
 
 from app.models.tender import (
     Tender, TenderDocument, TenderField, ProcessingState,
-    FieldSource, OCRStatus, DocumentType
+    FieldSource, OCRStatus
 )
 from app.services.deep_analyzer import DeepAnalyzer, UniversalFields
+from app.services.ai_analyzer import DocumentType, DOCUMENT_DETECTION_KEYWORDS
 
 
 class DeepAnalysisDBService:
     """
-    Service for on-demand deep analysis.
+    AI Process 2 - Universal Deep Analysis with DB integration.
     
-    Triggered when user opens a tender (not background).
+    User Shift operation (on click only).
+    This is expensive and must only run on user intent.
+    
     Implements:
-    - Annex reconciliation: Annex values can override main document
-    - Field provenance tracking: Source document tracked for each field
+    - Document priority ordering
+    - Full lot/item extraction
+    - Caution computation rules
+    - Verbatim technical descriptions
     """
     
     def __init__(self, db: Session):
@@ -36,33 +41,25 @@ class DeepAnalysisDBService:
         self.analyzer = DeepAnalyzer()
     
     def is_configured(self) -> bool:
-        """Check if DeepSeek API is configured."""
+        """Check if AI is configured."""
         return self.analyzer.is_configured()
     
     def needs_deep_analysis(self, tender_id: UUID) -> bool:
-        """
-        Check if tender needs deep analysis.
-        
-        Returns True if:
-        - Has extracted text
-        - No deep_analysis field exists yet
-        """
+        """Check if tender needs deep analysis."""
         tender = self.db.query(Tender).filter(Tender.id == tender_id).first()
         if not tender:
             return False
         
-        # Check for existing deep analysis
         existing = self.db.query(TenderField).filter(
             and_(
                 TenderField.tender_id == tender_id,
-                TenderField.field_name == "deep_analysis"
+                TenderField.field_name == "universal_analysis"
             )
         ).first()
         
         if existing:
             return False
         
-        # Check if has extracted documents
         docs_with_text = self.db.query(TenderDocument).filter(
             and_(
                 TenderDocument.tender_id == tender_id,
@@ -74,15 +71,11 @@ class DeepAnalysisDBService:
         return docs_with_text > 0
     
     def get_deep_analysis(self, tender_id: UUID) -> Optional[dict]:
-        """
-        Get existing deep analysis results.
-        
-        Returns None if not yet analyzed.
-        """
+        """Get existing deep analysis results."""
         field = self.db.query(TenderField).filter(
             and_(
                 TenderField.tender_id == tender_id,
-                TenderField.field_name == "deep_analysis"
+                TenderField.field_name == "universal_analysis"
             )
         ).first()
         
@@ -94,24 +87,28 @@ class DeepAnalysisDBService:
         
         return None
     
+    def _classify_document(self, first_page: str) -> str:
+        """Classify document by content keywords."""
+        text_lower = first_page.lower()
+        
+        for doc_type, keywords in DOCUMENT_DETECTION_KEYWORDS.items():
+            for keyword in keywords:
+                if keyword in text_lower:
+                    return doc_type.value
+        
+        return "unknown"
+    
     async def perform_deep_analysis(self, tender_id: UUID) -> dict:
         """
-        Perform on-demand deep analysis for a tender.
+        Perform Universal Deep Analysis.
         
-        This is triggered when user opens the tender detail page.
-        NOT a background job - runs synchronously on request.
-        
-        Args:
-            tender_id: Tender UUID
-            
-        Returns:
-            Analysis results with provenance info
+        This is triggered when user opens tender detail.
+        NOT a background job.
         """
         tender = self.db.query(Tender).filter(Tender.id == tender_id).first()
         if not tender:
             return {"error": "Tender not found"}
         
-        # Get all documents with extracted text
         documents = self.db.query(TenderDocument).filter(
             and_(
                 TenderDocument.tender_id == tender_id,
@@ -121,232 +118,185 @@ class DeepAnalysisDBService:
         ).all()
         
         if not documents:
-            return {"error": "No extracted text available for analysis"}
+            return {"error": "No extracted text available"}
         
-        # Check if API is configured
         if not self.is_configured():
             return {"error": "DeepSeek API key not configured"}
         
-        # Get existing Avis metadata for context
-        existing_metadata = self._get_existing_metadata(tender_id)
-        
-        # Prepare documents with annex identification
+        # Prepare documents with classification
         doc_list = []
         for doc in documents:
-            is_annex = self._is_annex_document(doc)
+            first_page = (doc.extracted_text or "")[:3000]
+            doc_type = self._classify_document(first_page)
+            
             doc_list.append({
                 "id": str(doc.id),
                 "filename": doc.filename,
                 "content": doc.extracted_text,
-                "is_annex": is_annex,
-                "document_type": doc.file_type.value if doc.file_type else "unknown"
+                "doc_type": doc_type
             })
         
-        # Sort: main documents first, annexes last (for override logic)
-        doc_list.sort(key=lambda x: x["is_annex"])
+        # Get existing Avis metadata for reference
+        existing_avis = self._get_avis_metadata(tender_id)
         
-        # Perform deep analysis
+        # Perform analysis
         try:
             result = await self.analyzer.analyze_documents(
                 documents=doc_list,
-                existing_metadata=existing_metadata
+                existing_avis=existing_avis
             )
         except Exception as e:
             return {"error": f"Analysis failed: {str(e)}"}
         
-        # Store results with provenance
-        fields_stored = self._store_deep_analysis(tender_id, result, doc_list)
+        # Store results
+        fields_stored = self._store_analysis(tender_id, result, doc_list)
         
-        # Update processing state
-        self._update_processing_state(tender_id)
+        # Count lots and items
+        total_lots = len(result.lots)
+        total_items = sum(len(lot.items) for lot in result.lots)
         
         return {
             "status": "completed",
             "tender_id": str(tender_id),
             "reference": tender.reference,
             "fields_extracted": fields_stored,
-            "lots_found": len(result.lots),
-            "has_execution_dates": result.execution_dates is not None,
-            "confidence_score": result.confidence_score,
+            "lots_found": total_lots,
+            "items_found": total_items,
+            "has_execution_dates": any(lot.execution_date for lot in result.lots),
+            "confidence_score": 0.9,
             "analysis": self.analyzer.to_dict(result)
         }
     
-    def _is_annex_document(self, doc: TenderDocument) -> bool:
-        """
-        Determine if document is an annex/attachment.
+    def _get_avis_metadata(self, tender_id: UUID) -> Optional[dict]:
+        """Get Avis metadata for reference."""
+        field = self.db.query(TenderField).filter(
+            and_(
+                TenderField.tender_id == tender_id,
+                TenderField.field_name == "avis_metadata"
+            )
+        ).first()
         
-        Annexes can override main document values.
-        """
-        filename_lower = doc.filename.lower()
+        if field:
+            try:
+                return json.loads(field.field_value)
+            except json.JSONDecodeError:
+                return None
         
-        annex_indicators = [
-            "annex", "annexe", "attachment", "piece_jointe",
-            "cahier_des_charges", "cdc", "cctp", "ccap",
-            "bordereau", "dpgf", "bpu", "dqe",
-            "reglement", "rc_", "cps", "cpc"
-        ]
-        
-        for indicator in annex_indicators:
-            if indicator in filename_lower:
-                return True
-        
-        return False
+        return None
     
-    def _get_existing_metadata(self, tender_id: UUID) -> Optional[dict]:
-        """Get previously extracted Avis metadata."""
-        fields = self.db.query(TenderField).filter(
-            TenderField.tender_id == tender_id
-        ).all()
-        
-        if not fields:
-            return None
-        
-        metadata = {}
-        for field in fields:
-            if field.field_name != "deep_analysis":
-                metadata[field.field_name] = {
-                    "value": field.field_value,
-                    "source": field.source.value if field.source else "unknown",
-                    "confidence": field.confidence
-                }
-        
-        return metadata if metadata else None
-    
-    def _store_deep_analysis(
+    def _store_analysis(
         self,
         tender_id: UUID,
         result: UniversalFields,
         documents: list[dict]
     ) -> int:
-        """
-        Store deep analysis results with provenance tracking.
-        
-        Implements annex reconciliation:
-        - Main document values are base
-        - Annex values can override specific fields
-        """
+        """Store Universal Deep Analysis results."""
         fields_stored = 0
-        analysis_dict = self.analyzer.to_dict(result)
         
-        # Find primary source document (first non-annex with content)
+        # Find primary document (CPS preferred)
         primary_doc_id = None
         for doc in documents:
-            if not doc["is_annex"]:
+            if doc.get("doc_type") == "cps":
                 primary_doc_id = doc["id"]
                 break
+        if not primary_doc_id:
+            for doc in documents:
+                if doc.get("doc_type") == "rc":
+                    primary_doc_id = doc["id"]
+                    break
         if not primary_doc_id and documents:
             primary_doc_id = documents[0]["id"]
         
-        # Store complete analysis as JSON field
+        # Store complete analysis
+        analysis_dict = self.analyzer.to_dict(result)
         self._store_field(
             tender_id=tender_id,
-            field_name="deep_analysis",
+            field_name="universal_analysis",
             field_value=json.dumps(analysis_dict, default=str),
             field_type="json",
             source=FieldSource.AI,
-            confidence=result.confidence_score,
+            confidence=0.9,
             document_id=primary_doc_id,
-            source_location="deep_analysis"
+            source_location="universal_deep_analysis"
         )
         fields_stored += 1
         
-        # Store individual important fields for easy querying
-        field_mappings = [
-            ("contract_type", result.contract_type, "text"),
-            ("procedure_type", result.procedure_type, "text"),
-            ("award_criteria", result.award_criteria, "text"),
-            ("payment_terms", result.payment_terms, "text"),
-            ("bid_guarantee", str(result.bid_guarantee) if result.bid_guarantee else None, "number"),
-            ("performance_guarantee", str(result.performance_guarantee) if result.performance_guarantee else None, "number"),
-            ("minimum_experience_years", str(result.minimum_experience_years) if result.minimum_experience_years else None, "number"),
-            ("minimum_turnover", str(result.minimum_turnover) if result.minimum_turnover else None, "number"),
-            ("subcontracting_allowed", str(result.subcontracting_allowed).lower(), "boolean"),
-            ("site_visit_required", str(result.site_visit_required).lower(), "boolean"),
-            ("site_visit_date", result.site_visit_date, "date"),
-            ("clarification_deadline", result.clarification_deadline, "date"),
+        # Store key fields individually for querying
+        simple_fields = [
+            ("deep_reference_tender", result.reference_tender),
+            ("deep_tender_type", result.tender_type),
+            ("deep_issuing_institution", result.issuing_institution),
+            ("deep_institution_address", result.institution_address),
+            ("deep_folder_opening_location", result.folder_opening_location),
+            ("deep_subject", result.subject),
         ]
         
-        for field_name, field_value, field_type in field_mappings:
-            if field_value:
+        for field_name, value in simple_fields:
+            if value:
                 self._store_field(
                     tender_id=tender_id,
-                    field_name=f"deep_{field_name}",
-                    field_value=field_value,
-                    field_type=field_type,
+                    field_name=field_name,
+                    field_value=str(value),
+                    field_type="text",
                     source=FieldSource.AI,
-                    confidence=result.confidence_score,
+                    confidence=0.9,
                     document_id=primary_doc_id,
-                    source_location="deep_analysis"
+                    source_location="universal_deep_analysis"
                 )
                 fields_stored += 1
         
-        # Store lots if present
+        # Store estimated value
+        if result.total_estimated_value:
+            self._store_field(
+                tender_id=tender_id,
+                field_name="deep_total_estimated_value",
+                field_value=str(result.total_estimated_value),
+                field_type="number",
+                source=FieldSource.AI,
+                confidence=0.9,
+                document_id=primary_doc_id,
+                source_location="universal_deep_analysis"
+            )
+            fields_stored += 1
+        
+        # Store submission deadline
+        if result.submission_deadline.date:
+            self._store_field(
+                tender_id=tender_id,
+                field_name="deep_submission_deadline_date",
+                field_value=result.submission_deadline.date,
+                field_type="date",
+                source=FieldSource.AI,
+                confidence=0.9,
+                document_id=primary_doc_id,
+                source_location="universal_deep_analysis"
+            )
+            fields_stored += 1
+        
+        if result.submission_deadline.time:
+            self._store_field(
+                tender_id=tender_id,
+                field_name="deep_submission_deadline_time",
+                field_value=result.submission_deadline.time,
+                field_type="text",
+                source=FieldSource.AI,
+                confidence=0.9,
+                document_id=primary_doc_id,
+                source_location="universal_deep_analysis"
+            )
+            fields_stored += 1
+        
+        # Store lots with full structure (including items)
         if result.lots:
             self._store_field(
                 tender_id=tender_id,
-                field_name="lots",
+                field_name="universal_lots",
                 field_value=json.dumps([asdict(lot) for lot in result.lots], default=str),
                 field_type="json",
                 source=FieldSource.AI,
-                confidence=result.confidence_score,
+                confidence=0.9,
                 document_id=primary_doc_id,
-                source_location="deep_analysis"
-            )
-            fields_stored += 1
-        
-        # Store execution dates if present
-        if result.execution_dates:
-            self._store_field(
-                tender_id=tender_id,
-                field_name="execution_dates",
-                field_value=json.dumps(asdict(result.execution_dates), default=str),
-                field_type="json",
-                source=FieldSource.AI,
-                confidence=result.confidence_score,
-                document_id=primary_doc_id,
-                source_location="deep_analysis"
-            )
-            fields_stored += 1
-        
-        # Store technical requirements as list
-        if result.technical_specifications:
-            self._store_field(
-                tender_id=tender_id,
-                field_name="technical_specifications",
-                field_value=json.dumps(result.technical_specifications),
-                field_type="list",
-                source=FieldSource.AI,
-                confidence=result.confidence_score,
-                document_id=primary_doc_id,
-                source_location="deep_analysis"
-            )
-            fields_stored += 1
-        
-        # Store quality standards
-        if result.quality_standards:
-            self._store_field(
-                tender_id=tender_id,
-                field_name="quality_standards",
-                field_value=json.dumps(result.quality_standards),
-                field_type="list",
-                source=FieldSource.AI,
-                confidence=result.confidence_score,
-                document_id=primary_doc_id,
-                source_location="deep_analysis"
-            )
-            fields_stored += 1
-        
-        # Store required certifications
-        if result.required_certifications:
-            self._store_field(
-                tender_id=tender_id,
-                field_name="required_certifications",
-                field_value=json.dumps(result.required_certifications),
-                field_type="list",
-                source=FieldSource.AI,
-                confidence=result.confidence_score,
-                document_id=primary_doc_id,
-                source_location="deep_analysis"
+                source_location="universal_deep_analysis"
             )
             fields_stored += 1
         
@@ -364,8 +314,7 @@ class DeepAnalysisDBService:
         document_id: Optional[str],
         source_location: str
     ):
-        """Store or update a field with provenance."""
-        # Check for existing field
+        """Store or update a field."""
         existing = self.db.query(TenderField).filter(
             and_(
                 TenderField.tender_id == tender_id,
@@ -374,7 +323,6 @@ class DeepAnalysisDBService:
         ).first()
         
         if existing:
-            # Update existing
             existing.field_value = field_value
             existing.field_type = field_type
             existing.source = source
@@ -384,7 +332,6 @@ class DeepAnalysisDBService:
             if document_id:
                 existing.document_id = UUID(document_id)
         else:
-            # Create new
             field = TenderField(
                 tender_id=tender_id,
                 document_id=UUID(document_id) if document_id else None,
@@ -398,14 +345,12 @@ class DeepAnalysisDBService:
             self.db.add(field)
     
     def _update_processing_state(self, tender_id: UUID):
-        """Update processing state to reflect deep analysis completion."""
+        """Update processing state for deep analysis."""
         state = self.db.query(ProcessingState).filter(
             ProcessingState.tender_id == tender_id
         ).first()
         
         if state:
-            state.ai_analyzed = True
-            state.ai_analyzed_at = datetime.utcnow()
             state.updated_at = datetime.utcnow()
         
         self.db.commit()
